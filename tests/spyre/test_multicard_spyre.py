@@ -168,6 +168,7 @@ def run_multicard_smoke_test(
     from transformers import AutoTokenizer
 
     from hf_adapters import AutoSpyreModelForCausalLM
+    from tests.conftest import encode_generation_inputs
 
     aiu_ids_env = os.environ.get("AIU_IDS")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -239,52 +240,46 @@ def run_multicard_smoke_test(
         print(f"  Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}")
         return result
 
-    # ── Phase 2: generation (warm up) ────────────────────────────────────────────────
-    print(f"\n{'=' * 20} Warmup Model...")
-    gen_t0 = time.time()
-    try:
+    encoded = encode_generation_inputs(tokenizer, [_PROMPT])
+
+    def _run_generate() -> tuple[str, str]:
+        """Run one generate call, return (output_text, captured_stdout)."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            outputs = model.generate(
-                tokenizer,
-                [_PROMPT],
+            sequences = model.generate(
+                **encoded,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 timing=True,
             )
-        result["gen_s"] = time.time() - gen_t0
         captured = buf.getvalue()
-        print(captured, end="")  # echo timing lines to the caller's stdout
-    except Exception:
-        result["gen_s"] = time.time() - gen_t0
-        result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
-        print(
-            f"  Generate warm up FAILED (after {result['gen_s']:.1f}s):\n{result['error']}"
+        print(captured, end="")
+        output_text = tokenizer.decode(
+            sequences[0, encoded["input_ids"].shape[1]:],
+            skip_special_tokens=True,
         )
+        return output_text, captured
+
+    # ── Phase 2: generation (warm up) ────────────────────────────────────────────────
+    print(f"\n{'=' * 20} Warmup Model...")
+    try:
+        _run_generate()
+    except Exception:
+        result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
+        print(f"  Generate warm up FAILED:\n{result['error']}")
 
     # ── Phase 3: generation ────────────────────────────────────────────────
     print(f"\n{'=' * 20} Run Model...")
     gen_t0 = time.time()
     try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            outputs = model.generate(
-                tokenizer,
-                [_PROMPT],
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                timing=True,
-            )
+        output_text, captured = _run_generate()
         result["gen_s"] = time.time() - gen_t0
-        captured = buf.getvalue()
-        print(captured, end="")  # echo timing lines to the caller's stdout
 
         ttft, decode, per_token = _parse_timing(captured)
         result["ttft_ms"] = ttft
         result["decode_ms"] = decode
         result["steady_itl_ms"] = _steady_state_itl(per_token)
 
-        output_text = outputs[0] if outputs else ""
         result["output"] = output_text
         print(f"  Output     : {output_text!r}")
         print(f"  Gen time   : {result['gen_s']:.1f}s  [OK]")
