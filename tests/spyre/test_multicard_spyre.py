@@ -69,6 +69,7 @@ import traceback
 from typing import Any
 
 import pytest
+import torch
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -136,7 +137,9 @@ def _steady_state_itl(per_token: list[float]) -> float | None:
 
 
 def run_multicard_smoke_test(
-    model_path: str, max_new_tokens: int = _DEFAULT_MAX_NEW_TOKENS
+    model_path: str,
+    max_new_tokens: int = _DEFAULT_MAX_NEW_TOKENS,
+    dtype: "torch.dtype | None" = None,
 ) -> dict[str, Any]:
     """Load model under the current AIU_IDS env, generate tokens, return diagnostics.
 
@@ -162,7 +165,6 @@ def run_multicard_smoke_test(
     # as a PyTorch backend at import time; importing it before torch triggers a
     # circular import error.
     import torch  # noqa: F401  — must precede any torch_spyre import
-
     from transformers import AutoTokenizer
 
     from hf_adapters import AutoSpyreModelForCausalLM
@@ -171,6 +173,25 @@ def run_multicard_smoke_test(
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
+    if aiu_ids_env is None and world_size > 1:
+        import torch.spyre as _spyre
+
+        available = _spyre.device_count()
+        if available < world_size:
+            raise RuntimeError(
+                f"WORLD_SIZE={world_size} but torch.spyre.device_count()={available}"
+            )
+        rank_ids = []
+        for x in range(world_size):
+            val = os.environ.get(f"AIU_WORLD_RANK_{x}")
+            if val is None:
+                rank_ids = None
+                break
+            rank_ids.append(val)
+        if rank_ids is not None:
+            aiu_ids_env = ",".join(rank_ids)
+            os.environ["AIU_IDS"] = aiu_ids_env
+
     print(f"\n{'=' * 70}")
     print(f"  Multicard smoke test  [rank {local_rank}/{world_size}]")
     print(f"  Model         : {model_path}")
@@ -178,6 +199,8 @@ def run_multicard_smoke_test(
     print(f"  LOCAL_RANK    : {local_rank}")
     print(f"  WORLD_SIZE    : {world_size}")
     print(f"  max_new_tokens: {max_new_tokens}")
+    print(f"  Datatype      : {dtype}")
+    print(f"  Prompt        : {_PROMPT!r}")
     print(f"{'=' * 70}")
 
     result: dict[str, Any] = {
@@ -196,12 +219,17 @@ def run_multicard_smoke_test(
     }
 
     # ── Phase 1: model load ────────────────────────────────────────────────
+    print(f"\n{'=' * 20} Loading Model...")
+
     model = None
     tokenizer = None
     load_t0 = time.time()
     try:
         tp = "auto" if world_size > 1 else None
-        model = AutoSpyreModelForCausalLM.from_pretrained(model_path, tp_plan=tp)
+        kwargs: dict[str, Any] = {"tp_plan": tp}
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        model = AutoSpyreModelForCausalLM.from_pretrained(model_path, **kwargs)
         result["load_s"] = time.time() - load_t0
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         print(f"  Load time  : {result['load_s']:.1f}s  [OK]")
@@ -211,8 +239,31 @@ def run_multicard_smoke_test(
         print(f"  Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}")
         return result
 
-    # ── Phase 2: generation ────────────────────────────────────────────────
-    print(f"  Prompt     : {_PROMPT!r}")
+    # ── Phase 2: generation (warm up) ────────────────────────────────────────────────
+    print(f"\n{'=' * 20} Warmup Model...")
+    gen_t0 = time.time()
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            outputs = model.generate(
+                tokenizer,
+                [_PROMPT],
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                timing=True,
+            )
+        result["gen_s"] = time.time() - gen_t0
+        captured = buf.getvalue()
+        print(captured, end="")  # echo timing lines to the caller's stdout
+    except Exception:
+        result["gen_s"] = time.time() - gen_t0
+        result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
+        print(
+            f"  Generate warm up FAILED (after {result['gen_s']:.1f}s):\n{result['error']}"
+        )
+
+    # ── Phase 3: generation ────────────────────────────────────────────────
+    print(f"\n{'=' * 20} Run Model...")
     gen_t0 = time.time()
     try:
         buf = io.StringIO()
@@ -238,14 +289,14 @@ def run_multicard_smoke_test(
         print(f"  Output     : {output_text!r}")
         print(f"  Gen time   : {result['gen_s']:.1f}s  [OK]")
         if result["steady_itl_ms"] is not None:
-            print(f"  Steady ITL : {result['steady_itl_ms']:.1f} ms  (outliers excluded)")
+            print(
+                f"  Steady ITL : {result['steady_itl_ms']:.1f} ms  (outliers excluded)"
+            )
         result["status"] = "PASS" if output_text.strip() else "FAIL"
     except Exception:
         result["gen_s"] = time.time() - gen_t0
         result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
-        print(
-            f"  Generate FAILED (after {result['gen_s']:.1f}s):\n{result['error']}"
-        )
+        print(f"  Generate FAILED (after {result['gen_s']:.1f}s):\n{result['error']}")
 
     return result
 
@@ -267,9 +318,9 @@ def test_multicard_smoke_single_card(model_path: str) -> None:
         f"Smoke test failed with status {result['status']}.\n"
         f"Error: {result['error']}"
     )
-    assert _EXPECTED_SUBSTRING.lower() in result["output"].lower(), (
-        f"Expected {_EXPECTED_SUBSTRING!r} in output, got {result['output']!r}"
-    )
+    assert (
+        _EXPECTED_SUBSTRING.lower() in result["output"].lower()
+    ), f"Expected {_EXPECTED_SUBSTRING!r} in output, got {result['output']!r}"
 
 
 # ---------------------------------------------------------------------------

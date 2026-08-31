@@ -59,6 +59,11 @@ import argparse
 import os
 import sys
 
+import torch
+
+# dtype note: pass --dtype float16 to avoid the error:
+#   torch._inductor.exc.InductorError: RuntimeError: Unsupported operation 'add' for data type BFLOAT16. Check torch-spyre/_inductor/constants.py::SPYRE_FP32_OPS and tests/inductor/test_inductor_ops.py for supported operations.
+
 # Ensure the project root (parent of scripts/) is on sys.path so that
 # tests.spyre.test_multicard_spyre can be imported when running directly
 # from anywhere inside the repo.
@@ -88,6 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_NEW_TOKENS,
         help=f"Token generation budget (default: {DEFAULT_MAX_NEW_TOKENS}).",
     )
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        help=(
+            "Torch dtype to pass to AutoSpyreModelForCausalLM.from_pretrained "
+            "(e.g. float16, bfloat16, float32).  Omit to let the model decide."
+        ),
+    )
     return parser
 
 
@@ -97,10 +110,44 @@ def _fmt(value: float | None, unit: str = "") -> str:
     return f"{value:.1f}{unit}"
 
 
+_DTYPE_MAP: dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.dtype is not None:
+        if args.dtype not in _DTYPE_MAP:
+            raise ValueError(
+                f"Unknown --dtype {args.dtype!r}. "
+                f"Choose from: {', '.join(_DTYPE_MAP)}"
+            )
+    dtype = _DTYPE_MAP.get(args.dtype) if args.dtype is not None else None
 
     aiu_ids = os.environ.get("AIU_IDS")
+
+    if aiu_ids is None:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1:
+            # import torch_spyre  # noqa: F401
+            # import torch.spyre as _spyre
+            available = torch.spyre.device_count()
+            if available < world_size:
+                raise RuntimeError(
+                    f"WORLD_SIZE={world_size} but torch.spyre.device_count()={available}"
+                )
+            rank_ids = []
+            for x in range(world_size):
+                val = os.environ.get(f"AIU_WORLD_RANK_{x}")
+                if val is None:
+                    rank_ids = None
+                    break
+                rank_ids.append(val)
+            if rank_ids is not None:
+                aiu_ids = ",".join(rank_ids)
 
     print()
     print("=" * 70)
@@ -116,9 +163,10 @@ def main(argv: list[str] | None = None) -> None:
         print("  Cards detected   : AIU_IDS not set — single-card / default behaviour")
     print(f"  Model            : {args.model}")
     print(f"  max_new_tokens   : {args.max_new_tokens}")
+    print(f"  dtype            : {args.dtype or '(not set — model default)'}")
     print("=" * 70)
 
-    result = run_multicard_smoke_test(args.model, args.max_new_tokens)
+    result = run_multicard_smoke_test(args.model, args.max_new_tokens, dtype=dtype)
 
     # ── Summary table ──────────────────────────────────────────────────────
     print()
