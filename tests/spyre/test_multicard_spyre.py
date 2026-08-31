@@ -193,6 +193,15 @@ def run_multicard_smoke_test(
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
+    # If AIU_IDS has more addresses than WORLD_SIZE (e.g. all 4 cards set but
+    # only 1 or 2 ranks launched), trim it so we only report/use the cards
+    # that are actually assigned to this run.
+    if aiu_ids_env is not None:
+        _ids = [c.strip() for c in aiu_ids_env.split(",") if c.strip()]
+        if len(_ids) > world_size:
+            aiu_ids_env = ",".join(_ids[:world_size])
+            os.environ["AIU_IDS"] = aiu_ids_env
+
     if aiu_ids_env is None and world_size > 1:
         import torch.spyre as _spyre
 

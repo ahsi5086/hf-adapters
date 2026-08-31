@@ -145,12 +145,17 @@ def main(argv: list[str] | None = None) -> None:
     dtype = _DTYPE_MAP.get(args.dtype) if args.dtype is not None else None
 
     aiu_ids = os.environ.get("AIU_IDS")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    # Trim AIU_IDS to WORLD_SIZE entries so a 4-address env var doesn't get
+    # printed when only 1 or 2 ranks are actually launched.
+    if aiu_ids is not None:
+        _ids = [c.strip() for c in aiu_ids.split(",") if c.strip()]
+        if len(_ids) > world_size:
+            aiu_ids = ",".join(_ids[:world_size])
 
     if aiu_ids is None:
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size > 1:
-            # import torch_spyre  # noqa: F401
-            # import torch.spyre as _spyre
             available = torch.spyre.device_count()
             if available < world_size:
                 raise RuntimeError(
