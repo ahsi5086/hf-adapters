@@ -101,6 +101,23 @@ def build_parser() -> argparse.ArgumentParser:
             "(e.g. float16, bfloat16, float32).  Omit to let the model decide."
         ),
     )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of identical prompts to batch together (default: 1).",
+    )
+    parser.add_argument(
+        "--prompt-len",
+        type=int,
+        default=None,
+        metavar="L",
+        help=(
+            "Pad the tokenized prompt to exactly L tokens before generation. "
+            "Omit to use the natural token length."
+        ),
+    )
     return parser
 
 
@@ -163,10 +180,18 @@ def main(argv: list[str] | None = None) -> None:
         print("  Cards detected   : AIU_IDS not set — single-card / default behaviour")
     print(f"  Model            : {args.model}")
     print(f"  max_new_tokens   : {args.max_new_tokens}")
+    print(f"  batch            : {args.batch}")
+    print(f"  prompt_len       : {args.prompt_len if args.prompt_len is not None else '(natural)'}")
     print(f"  dtype            : {args.dtype or '(not set — model default)'}")
     print("=" * 70)
 
-    result = run_multicard_smoke_test(args.model, args.max_new_tokens, dtype=dtype)
+    result = run_multicard_smoke_test(
+        args.model,
+        args.max_new_tokens,
+        dtype=dtype,
+        batch_size=args.batch,
+        prompt_len=args.prompt_len,
+    )
 
     # ── Summary table ──────────────────────────────────────────────────────
     print()
@@ -175,6 +200,8 @@ def main(argv: list[str] | None = None) -> None:
     print("=" * 70)
     print(f"  AIU_IDS    : {result['aiu_ids_env']!r}")
     print(f"  Model      : {result['model']}")
+    print(f"  Batch      : {result['batch_size']}")
+    print(f"  Prompt len : {result['prompt_len'] if result['prompt_len'] is not None else '(natural)'}")
     print(f"  Status     : {result['status']}")
     print(f"  Load       : {_fmt(result['load_s'], 's')}")
     print(f"  Generate   : {_fmt(result['gen_s'], 's')}")

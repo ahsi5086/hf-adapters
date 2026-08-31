@@ -75,10 +75,17 @@ import torch
 # Constants
 # ---------------------------------------------------------------------------
 
+# TODO(torch-spyre): Once torch.spyre.get_device_name(i) is implemented (it
+# needs to call into Flex to map device index → PCI address), AIU_IDS can be
+# derived automatically and this env var requirement can be dropped entirely,
+# making the script fully PyTorch-native. 
+
 _DEFAULT_MODEL = "ibm-granite/granite-3.3-8b-instruct"
 _PROMPT = "The capital of France is"
 _EXPECTED_SUBSTRING = "Paris"
 _DEFAULT_MAX_NEW_TOKENS = 8
+_DEFAULT_BATCH_SIZE = 1
+_DEFAULT_PROMPT_LEN = None  # None → no padding, use natural token length
 
 # Compile-spike outlier filter: tokens whose latency exceeds this multiple of
 # the median are excluded from the steady-state ITL figure.  This catches the
@@ -140,6 +147,8 @@ def run_multicard_smoke_test(
     model_path: str,
     max_new_tokens: int = _DEFAULT_MAX_NEW_TOKENS,
     dtype: "torch.dtype | None" = None,
+    batch_size: int = _DEFAULT_BATCH_SIZE,
+    prompt_len: "int | None" = _DEFAULT_PROMPT_LEN,
 ) -> dict[str, Any]:
     """Load model under the current AIU_IDS env, generate tokens, return diagnostics.
 
@@ -147,18 +156,28 @@ def run_multicard_smoke_test(
     clearly identifies whether it occurred at load time or generate time, with
     the full traceback captured rather than swallowed.
 
+    Args:
+        model_path:     HuggingFace repo ID or local directory.
+        max_new_tokens: Token generation budget.
+        dtype:          Torch dtype passed to from_pretrained (None = model default).
+        batch_size:     Number of identical prompts to batch together (default 1).
+        prompt_len:     Pad the tokenized prompt to exactly this many tokens
+                        (None = no padding, use natural token length).
+
     Returns a dict with keys:
         model           - model path used
         aiu_ids_env     - value of AIU_IDS at call time (None if unset)
         local_rank      - LOCAL_RANK of this process
         world_size      - WORLD_SIZE of this run
+        batch_size      - batch size used
+        prompt_len      - prompt_len argument (None if not set)
         status          - "PASS" | "FAIL" | "ERROR"
         load_s          - seconds spent in from_pretrained (None on load error)
         gen_s           - seconds spent in generate() (None on gen error)
         ttft_ms         - first-token latency in ms (or None)
         decode_ms       - avg next-token latency in ms (or None)
         steady_itl_ms   - steady-state ITL with outliers removed (or None)
-        output          - generated text (empty string on any error)
+        output          - generated text for sequence 0 (empty string on any error)
         error           - "PHASE FAILED\\n<traceback>" string, or None on PASS
     """
     # torch MUST be imported before torch_spyre.  torch_spyre registers itself
@@ -200,6 +219,8 @@ def run_multicard_smoke_test(
     print(f"  LOCAL_RANK    : {local_rank}")
     print(f"  WORLD_SIZE    : {world_size}")
     print(f"  max_new_tokens: {max_new_tokens}")
+    print(f"  batch_size    : {batch_size}")
+    print(f"  prompt_len    : {prompt_len if prompt_len is not None else '(natural)'}")
     print(f"  Datatype      : {dtype}")
     print(f"  Prompt        : {_PROMPT!r}")
     print(f"{'=' * 70}")
@@ -209,6 +230,8 @@ def run_multicard_smoke_test(
         "aiu_ids_env": aiu_ids_env,
         "local_rank": local_rank,
         "world_size": world_size,
+        "batch_size": batch_size,
+        "prompt_len": prompt_len,
         "status": "ERROR",
         "load_s": None,
         "gen_s": None,
@@ -240,7 +263,30 @@ def run_multicard_smoke_test(
         print(f"  Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}")
         return result
 
-    encoded = encode_generation_inputs(tokenizer, [_PROMPT])
+    # Build the batched + optionally length-padded input tensor.
+    # batch_size > 1: repeat the same prompt N times (tests the KV cache batch
+    # scatter path without needing N different prompts).
+    # prompt_len: pad/truncate to a fixed token count so callers can exercise
+    # different cache shapes.
+    prompts = [_PROMPT] * batch_size
+    if prompt_len is not None:
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        encoded = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=prompt_len,
+            truncation=True,
+            return_attention_mask=True,
+        )
+    else:
+        encoded = encode_generation_inputs(tokenizer, prompts)
+
+    actual_prompt_len = encoded["input_ids"].shape[1]
+    print(f"  Input shape   : {list(encoded['input_ids'].shape)}  "
+          f"(batch={batch_size}, tokens={actual_prompt_len})")
 
     def _run_generate() -> tuple[str, str]:
         """Run one generate call, return (output_text, captured_stdout)."""
@@ -254,8 +300,9 @@ def run_multicard_smoke_test(
             )
         captured = buf.getvalue()
         print(captured, end="")
+        # Decode only the newly generated tokens for sequence 0.
         output_text = tokenizer.decode(
-            sequences[0, encoded["input_ids"].shape[1]:],
+            sequences[0, actual_prompt_len:],
             skip_special_tokens=True,
         )
         return output_text, captured
