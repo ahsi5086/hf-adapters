@@ -39,9 +39,9 @@ SPYRE_DEVICES tells the Flex runtime which card indices to use per rank.
 Index-to-physical-card mapping is handled internally by Flex and is not
 independently verifiable from this script.
 
-2-card example::
+2-card example (valid indices are node-specific — check yours first)::
 
-    export SPYRE_DEVICES=2,3
+    export SPYRE_DEVICES=0,1
     export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=2 --master-port=29500 \\
@@ -225,7 +225,6 @@ def run_multicard_smoke_test(
     if resolved_cards:
         print(f"  PCI hint      : {', '.join(resolved_cards)}  (AIU_WORLD_RANK_* guess, unconfirmed)")
     print(f"  AIU_IDS       : {aiu_ids_env!r}")
-    print(f"  LOCAL_RANK    : {local_rank}")
     print(f"  WORLD_SIZE    : {world_size}")
     print(f"  max_new_tokens: {max_new_tokens}")
     print(f"  batch_size    : {batch_size}")
@@ -271,7 +270,7 @@ def run_multicard_smoke_test(
     except Exception:
         result["load_s"] = time.time() - load_t0
         result["error"] = "LOAD FAILED\n" + traceback.format_exc()
-        print(f"  Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}")
+        print(f"  [rank {local_rank}] Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}")
         return result
 
     # Build the batched + optionally length-padded input tensor.
@@ -324,7 +323,7 @@ def run_multicard_smoke_test(
         _run_generate()
     except Exception:
         result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
-        print(f"  Generate warm up FAILED:\n{result['error']}")
+        print(f"  [rank {local_rank}] Warmup FAILED:\n{result['error']}")
 
     # ── Phase 3: generation ────────────────────────────────────────────────
     print(f"\n{'=' * 20} Run Model...")
@@ -349,7 +348,7 @@ def run_multicard_smoke_test(
     except Exception:
         result["gen_s"] = time.time() - gen_t0
         result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
-        print(f"  Generate FAILED (after {result['gen_s']:.1f}s):\n{result['error']}")
+        print(f"  [rank {local_rank}] Generate FAILED (after {result['gen_s']:.1f}s):\n{result['error']}")
 
     return result
 

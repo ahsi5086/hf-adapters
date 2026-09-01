@@ -25,9 +25,9 @@ SPYRE_DEVICES tells the Flex runtime which card indices to use per rank.
 Index-to-physical-card mapping is handled internally by Flex and is not
 independently verifiable from this script.
 
-2-card example::
+2-card example (valid indices are node-specific — check yours first)::
 
-    export SPYRE_DEVICES=2,3
+    export SPYRE_DEVICES=0,1
     export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=2 --master-port=29500 \\
@@ -144,7 +144,9 @@ def main(argv: list[str] | None = None) -> None:
 
     aiu_ids = os.environ.get("AIU_IDS")
     spyre_devices = os.environ.get("SPYRE_DEVICES")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_rank0 = local_rank == 0
 
     # Trim AIU_IDS to WORLD_SIZE entries so a 4-address env var doesn't get
     # printed when only 1 or 2 ranks are actually launched.
@@ -153,18 +155,19 @@ def main(argv: list[str] | None = None) -> None:
         if len(_ids) > world_size:
             aiu_ids = ",".join(_ids[:world_size])
 
-    print()
-    print("=" * 70)
-    print("  run_multicard_smoke")
-    print("=" * 70)
-    print(f"  SPYRE_DEVICES    : {spyre_devices!r}")
-    print(f"  AIU_IDS          : {aiu_ids!r}  (fallback; SPYRE_DEVICES is primary)")
-    print(f"  Model            : {args.model}")
-    print(f"  max_new_tokens   : {args.max_new_tokens}")
-    print(f"  batch            : {args.batch}")
-    print(f"  prompt_len       : {args.prompt_len if args.prompt_len is not None else '(natural)'}")
-    print(f"  dtype            : {args.dtype or '(not set — model default)'}")
-    print("=" * 70)
+    if is_rank0:
+        print()
+        print("=" * 70)
+        print("  run_multicard_smoke")
+        print("=" * 70)
+        print(f"  SPYRE_DEVICES    : {spyre_devices!r}")
+        print(f"  AIU_IDS          : {aiu_ids!r}  (fallback; SPYRE_DEVICES is primary)")
+        print(f"  Model            : {args.model}")
+        print(f"  max_new_tokens   : {args.max_new_tokens}")
+        print(f"  batch            : {args.batch}")
+        print(f"  prompt_len       : {args.prompt_len if args.prompt_len is not None else '(natural)'}")
+        print(f"  dtype            : {args.dtype or '(not set — model default)'}")
+        print("=" * 70)
 
     result = run_multicard_smoke_test(
         args.model,
@@ -175,31 +178,45 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # ── Summary table ──────────────────────────────────────────────────────
-    print()
-    print("=" * 70)
-    print("  RESULTS SUMMARY")
-    print("=" * 70)
-    print(f"  SPYRE_DEVICES : {result['spyre_devices_env']!r}")
-    if result['resolved_cards']:
-        print(f"  PCI hint      : {', '.join(result['resolved_cards'])}  (AIU_WORLD_RANK_* guess, unconfirmed)")
-    print(f"  AIU_IDS       : {result['aiu_ids_env']!r}")
-    print(f"  Model         : {result['model']}")
-    print(f"  Batch      : {result['batch_size']}")
-    print(f"  Prompt len : {result['prompt_len'] if result['prompt_len'] is not None else '(natural)'}")
-    print(f"  Status     : {result['status']}")
-    print(f"  Load       : {_fmt(result['load_s'], 's')}")
-    print(f"  Generate   : {_fmt(result['gen_s'], 's')}")
-    print(f"  TTFT       : {_fmt(result['ttft_ms'], ' ms')}")
-    print(f"  Decode avg : {_fmt(result['decode_ms'], ' ms')}")
-    print(f"  Steady ITL : {_fmt(result['steady_itl_ms'], ' ms')}  (outliers excluded)")
-    print(f"  Output     : {result['output']!r}")
-    if result["error"]:
-        print()
-        print("  ERROR DETAIL:")
-        for line in result["error"].splitlines():
-            print(f"    {line}")
-    print("=" * 70)
-    print()
+    # Each rank builds its summary as one string and writes it atomically.
+    # A brief sleep stagger keeps blocks from interleaving in the terminal.
+    import time
+
+    def _rank_summary(r: dict) -> str:
+        lines = [
+            "",
+            "=" * 70,
+            f"  RESULTS SUMMARY  [rank {r['local_rank']}/{r['world_size']}]",
+            "=" * 70,
+            f"  SPYRE_DEVICES : {r['spyre_devices_env']!r}",
+        ]
+        if r["resolved_cards"]:
+            lines.append(
+                f"  PCI hint      : {', '.join(r['resolved_cards'])}"
+                f"  (AIU_WORLD_RANK_* guess, unconfirmed)"
+            )
+        lines += [
+            f"  AIU_IDS       : {r['aiu_ids_env']!r}",
+            f"  Model         : {r['model']}",
+            f"  Batch      : {r['batch_size']}",
+            f"  Prompt len : {r['prompt_len'] if r['prompt_len'] is not None else '(natural)'}",
+            f"  Status     : {r['status']}",
+            f"  Load       : {_fmt(r['load_s'], 's')}",
+            f"  Generate   : {_fmt(r['gen_s'], 's')}",
+            f"  TTFT       : {_fmt(r['ttft_ms'], ' ms')}",
+            f"  Decode avg : {_fmt(r['decode_ms'], ' ms')}",
+            f"  Steady ITL : {_fmt(r['steady_itl_ms'], ' ms')}  (outliers excluded)",
+            f"  Output     : {r['output']!r}",
+        ]
+        if r["error"]:
+            lines += ["", "  ERROR DETAIL:"]
+            lines += [f"    {line}" for line in r["error"].splitlines()]
+        lines += ["=" * 70, ""]
+        return "\n".join(lines)
+
+    time.sleep(local_rank * 0.3)
+    sys.stdout.write(_rank_summary(result))
+    sys.stdout.flush()
 
     os._exit(0 if result["status"] == "PASS" else 1)
 
