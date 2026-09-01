@@ -21,24 +21,25 @@ Requirements:
   - transformers==5.15.x  (uv pip install "transformers==5.15.0")
   - HF_DEACTIVATE_ASYNC_LOAD=1  (disables async weight loading, required for TP with transformers 5.15)
 
-AIU_IDS is a comma-separated list of PCI addresses for the cards to use.
-Set it to match the cards available in your environment.
+SPYRE_DEVICES tells the Flex runtime which card indices to use per rank.
+Index-to-physical-card mapping is handled internally by Flex and is not
+independently verifiable from this script.
 
 2-card example::
 
-    export AIU_IDS="<card0-pci>,<card1-pci>"
+    export SPYRE_DEVICES=2,3
     export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=2 --master-port=29500 \\
-        scripts/run_multicard_smoke.py
+        scripts/run_multicard_smoke.py --dtype float16
 
 4-card example::
 
-    export AIU_IDS="<card0-pci>,<card1-pci>,<card2-pci>,<card3-pci>"
+    export SPYRE_DEVICES=0,1,2,3
     export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=4 --master-port=29500 \\
-        scripts/run_multicard_smoke.py
+        scripts/run_multicard_smoke.py --dtype float16
 
 Single-card::
 
@@ -60,9 +61,6 @@ import os
 import sys
 
 import torch
-
-# dtype note: pass --dtype float16 to avoid the error:
-#   torch._inductor.exc.InductorError: RuntimeError: Unsupported operation 'add' for data type BFLOAT16. Check torch-spyre/_inductor/constants.py::SPYRE_FP32_OPS and tests/inductor/test_inductor_ops.py for supported operations.
 
 # Ensure the project root (parent of scripts/) is on sys.path so that
 # tests.spyre.test_multicard_spyre can be imported when running directly
@@ -145,6 +143,7 @@ def main(argv: list[str] | None = None) -> None:
     dtype = _DTYPE_MAP.get(args.dtype) if args.dtype is not None else None
 
     aiu_ids = os.environ.get("AIU_IDS")
+    spyre_devices = os.environ.get("SPYRE_DEVICES")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     # Trim AIU_IDS to WORLD_SIZE entries so a 4-address env var doesn't get
@@ -154,35 +153,12 @@ def main(argv: list[str] | None = None) -> None:
         if len(_ids) > world_size:
             aiu_ids = ",".join(_ids[:world_size])
 
-    if aiu_ids is None:
-        if world_size > 1:
-            available = torch.spyre.device_count()
-            if available < world_size:
-                raise RuntimeError(
-                    f"WORLD_SIZE={world_size} but torch.spyre.device_count()={available}"
-                )
-            rank_ids = []
-            for x in range(world_size):
-                val = os.environ.get(f"AIU_WORLD_RANK_{x}")
-                if val is None:
-                    rank_ids = None
-                    break
-                rank_ids.append(val)
-            if rank_ids is not None:
-                aiu_ids = ",".join(rank_ids)
-
     print()
     print("=" * 70)
     print("  run_multicard_smoke")
     print("=" * 70)
-    print(f"  AIU_IDS          : {aiu_ids!r}")
-    if aiu_ids:
-        cards = [c.strip() for c in aiu_ids.split(",") if c.strip()]
-        print(f"  Cards detected   : {len(cards)}")
-        for i, addr in enumerate(cards):
-            print(f"    [{i}] {addr}")
-    else:
-        print("  Cards detected   : AIU_IDS not set — single-card / default behaviour")
+    print(f"  SPYRE_DEVICES    : {spyre_devices!r}")
+    print(f"  AIU_IDS          : {aiu_ids!r}  (fallback; SPYRE_DEVICES is primary)")
     print(f"  Model            : {args.model}")
     print(f"  max_new_tokens   : {args.max_new_tokens}")
     print(f"  batch            : {args.batch}")
@@ -203,8 +179,11 @@ def main(argv: list[str] | None = None) -> None:
     print("=" * 70)
     print("  RESULTS SUMMARY")
     print("=" * 70)
-    print(f"  AIU_IDS    : {result['aiu_ids_env']!r}")
-    print(f"  Model      : {result['model']}")
+    print(f"  SPYRE_DEVICES : {result['spyre_devices_env']!r}")
+    if result['resolved_cards']:
+        print(f"  PCI hint      : {', '.join(result['resolved_cards'])}  (AIU_WORLD_RANK_* guess, unconfirmed)")
+    print(f"  AIU_IDS       : {result['aiu_ids_env']!r}")
+    print(f"  Model         : {result['model']}")
     print(f"  Batch      : {result['batch_size']}")
     print(f"  Prompt len : {result['prompt_len'] if result['prompt_len'] is not None else '(natural)'}")
     print(f"  Status     : {result['status']}")

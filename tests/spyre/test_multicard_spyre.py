@@ -35,24 +35,25 @@ First make sure transformers is at the right version::
 
     uv pip install "transformers==5.15.0"
 
-AIU_IDS is a comma-separated list of PCI addresses for the cards to use.
-Set it to match the cards available in your environment.
+SPYRE_DEVICES tells the Flex runtime which card indices to use per rank.
+Index-to-physical-card mapping is handled internally by Flex and is not
+independently verifiable from this script.
 
 2-card example::
 
-    export AIU_IDS="<card0-pci>,<card1-pci>"
+    export SPYRE_DEVICES=2,3
     export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=2 --master-port=29500 \\
-        scripts/run_multicard_smoke.py
+        scripts/run_multicard_smoke.py --dtype float16
 
 4-card example::
 
-    export AIU_IDS="<card0-pci>,<card1-pci>,<card2-pci>,<card3-pci>"
+    export SPYRE_DEVICES=0,1,2,3
     export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=4 --master-port=29500 \\
-        scripts/run_multicard_smoke.py
+        scripts/run_multicard_smoke.py --dtype float16
 
 pytest (single-card only — multi-card requires torchrun, see above)::
 
@@ -76,9 +77,8 @@ import torch
 # ---------------------------------------------------------------------------
 
 # TODO(torch-spyre): Once torch.spyre.get_device_name(i) is implemented (it
-# needs to call into Flex to map device index → PCI address), AIU_IDS can be
-# derived automatically and this env var requirement can be dropped entirely,
-# making the script fully PyTorch-native. 
+# needs to call into Flex to map device index → PCI address), resolved_cards
+# can be derived automatically without relying on AIU_WORLD_RANK_* env vars.
 
 _DEFAULT_MODEL = "ibm-granite/granite-3.3-8b-instruct"
 _PROMPT = "The capital of France is"
@@ -150,8 +150,9 @@ def run_multicard_smoke_test(
     batch_size: int = _DEFAULT_BATCH_SIZE,
     prompt_len: "int | None" = _DEFAULT_PROMPT_LEN,
 ) -> dict[str, Any]:
-    """Load model under the current AIU_IDS env, generate tokens, return diagnostics.
+    """Load model and generate tokens; return a diagnostics dict.
 
+    Card selection is driven by SPYRE_DEVICES (primary) or AIU_IDS (fallback).
     Load and generation are wrapped in separate try/except blocks so a failure
     clearly identifies whether it occurred at load time or generate time, with
     the full traceback captured rather than swallowed.
@@ -165,20 +166,23 @@ def run_multicard_smoke_test(
                         (None = no padding, use natural token length).
 
     Returns a dict with keys:
-        model           - model path used
-        aiu_ids_env     - value of AIU_IDS at call time (None if unset)
-        local_rank      - LOCAL_RANK of this process
-        world_size      - WORLD_SIZE of this run
-        batch_size      - batch size used
-        prompt_len      - prompt_len argument (None if not set)
-        status          - "PASS" | "FAIL" | "ERROR"
-        load_s          - seconds spent in from_pretrained (None on load error)
-        gen_s           - seconds spent in generate() (None on gen error)
-        ttft_ms         - first-token latency in ms (or None)
-        decode_ms       - avg next-token latency in ms (or None)
-        steady_itl_ms   - steady-state ITL with outliers removed (or None)
-        output          - generated text for sequence 0 (empty string on any error)
-        error           - "PHASE FAILED\\n<traceback>" string, or None on PASS
+        model              - model path used
+        spyre_devices_env  - value of SPYRE_DEVICES at call time (None if unset)
+        resolved_cards     - PCI hint list derived from AIU_WORLD_RANK_N env vars
+                             (informational only; not confirmed by the runtime)
+        aiu_ids_env        - value of AIU_IDS at call time (None if unset)
+        local_rank         - LOCAL_RANK of this process
+        world_size         - WORLD_SIZE of this run
+        batch_size         - batch size used
+        prompt_len         - prompt_len argument (None if not set)
+        status             - "PASS" | "FAIL" | "ERROR"
+        load_s             - seconds spent in from_pretrained (None on load error)
+        gen_s              - seconds spent in generate() (None on gen error)
+        ttft_ms            - first-token latency in ms (or None)
+        decode_ms          - avg next-token latency in ms (or None)
+        steady_itl_ms      - steady-state ITL with outliers removed (or None)
+        output             - generated text for sequence 0 (empty string on any error)
+        error              - "PHASE FAILED\\n<traceback>" string, or None on PASS
     """
     # torch MUST be imported before torch_spyre.  torch_spyre registers itself
     # as a PyTorch backend at import time; importing it before torch triggers a
@@ -190,40 +194,36 @@ def run_multicard_smoke_test(
     from tests.conftest import encode_generation_inputs
 
     aiu_ids_env = os.environ.get("AIU_IDS")
+    spyre_devices_env = os.environ.get("SPYRE_DEVICES")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     # If AIU_IDS has more addresses than WORLD_SIZE (e.g. all 4 cards set but
-    # only 1 or 2 ranks launched), trim it so we only report/use the cards
-    # that are actually assigned to this run.
+    # only 1 or 2 ranks launched), trim to WORLD_SIZE entries for display.
     if aiu_ids_env is not None:
         _ids = [c.strip() for c in aiu_ids_env.split(",") if c.strip()]
         if len(_ids) > world_size:
             aiu_ids_env = ",".join(_ids[:world_size])
             os.environ["AIU_IDS"] = aiu_ids_env
 
-    if aiu_ids_env is None and world_size > 1:
-        import torch.spyre as _spyre
-
-        available = _spyre.device_count()
-        if available < world_size:
-            raise RuntimeError(
-                f"WORLD_SIZE={world_size} but torch.spyre.device_count()={available}"
-            )
-        rank_ids = []
-        for x in range(world_size):
-            val = os.environ.get(f"AIU_WORLD_RANK_{x}")
-            if val is None:
-                rank_ids = None
-                break
-            rank_ids.append(val)
-        if rank_ids is not None:
-            aiu_ids_env = ",".join(rank_ids)
-            os.environ["AIU_IDS"] = aiu_ids_env
+    # Attempt to map SPYRE_DEVICES indices to PCI addresses via AIU_WORLD_RANK_*
+    # env vars set by the system login script.  This is a local hint only —
+    # not confirmation of what Flex actually bound.  There is currently no API
+    # to query the runtime for the real mapping; see TODO at top.
+    resolved_cards: list[str] = []
+    if spyre_devices_env is not None:
+        for idx_str in spyre_devices_env.split(","):
+            idx_str = idx_str.strip()
+            if idx_str.isdigit():
+                pci = os.environ.get(f"AIU_WORLD_RANK_{idx_str}")
+                resolved_cards.append(pci if pci else f"index {idx_str} (unresolved)")
 
     print(f"\n{'=' * 70}")
     print(f"  Multicard smoke test  [rank {local_rank}/{world_size}]")
     print(f"  Model         : {model_path}")
+    print(f"  SPYRE_DEVICES : {spyre_devices_env!r}")
+    if resolved_cards:
+        print(f"  PCI hint      : {', '.join(resolved_cards)}  (AIU_WORLD_RANK_* guess, unconfirmed)")
     print(f"  AIU_IDS       : {aiu_ids_env!r}")
     print(f"  LOCAL_RANK    : {local_rank}")
     print(f"  WORLD_SIZE    : {world_size}")
@@ -236,6 +236,8 @@ def run_multicard_smoke_test(
 
     result: dict[str, Any] = {
         "model": model_path,
+        "spyre_devices_env": spyre_devices_env,
+        "resolved_cards": resolved_cards,
         "aiu_ids_env": aiu_ids_env,
         "local_rank": local_rank,
         "world_size": world_size,
