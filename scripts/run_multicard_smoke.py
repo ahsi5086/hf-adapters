@@ -19,7 +19,6 @@ per card).  For single-card, plain python works.
 
 Requirements:
   - transformers==5.15.x  (uv pip install "transformers==5.15.0")
-  - HF_DEACTIVATE_ASYNC_LOAD=1  (disables async weight loading, required for TP with transformers 5.15)
 
 SPYRE_DEVICES tells the Flex runtime which card indices to use per rank.
 Index-to-physical-card mapping is handled internally by Flex and is not
@@ -28,7 +27,6 @@ independently verifiable from this script.
 2-card example (valid indices are node-specific — check yours first)::
 
     export SPYRE_DEVICES=0,1
-    export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=2 --master-port=29500 \\
         scripts/run_multicard_smoke.py --dtype float16
@@ -36,7 +34,6 @@ independently verifiable from this script.
 4-card example::
 
     export SPYRE_DEVICES=0,1,2,3
-    export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=4 --master-port=29500 \\
         scripts/run_multicard_smoke.py --dtype float16
@@ -106,16 +103,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Number of identical prompts to batch together (default: 1).",
     )
-    parser.add_argument(
-        "--prompt-len",
-        type=int,
-        default=None,
-        metavar="L",
-        help=(
-            "Pad the tokenized prompt to exactly L tokens before generation. "
-            "Omit to use the natural token length."
-        ),
-    )
     return parser
 
 
@@ -165,7 +152,6 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  Model            : {args.model}")
         print(f"  max_new_tokens   : {args.max_new_tokens}")
         print(f"  batch            : {args.batch}")
-        print(f"  prompt_len       : {args.prompt_len if args.prompt_len is not None else '(natural)'}")
         print(f"  dtype            : {args.dtype or '(not set — model default)'}")
         print("=" * 70)
 
@@ -174,7 +160,6 @@ def main(argv: list[str] | None = None) -> None:
         args.max_new_tokens,
         dtype=dtype,
         batch_size=args.batch,
-        prompt_len=args.prompt_len,
     )
 
     # ── Summary table ──────────────────────────────────────────────────────
@@ -199,7 +184,6 @@ def main(argv: list[str] | None = None) -> None:
             f"  AIU_IDS       : {r['aiu_ids_env']!r}",
             f"  Model         : {r['model']}",
             f"  Batch      : {r['batch_size']}",
-            f"  Prompt len : {r['prompt_len'] if r['prompt_len'] is not None else '(natural)'}",
             f"  Status     : {r['status']}",
             f"  Load       : {_fmt(r['load_s'], 's')}",
             f"  Generate   : {_fmt(r['gen_s'], 's')}",

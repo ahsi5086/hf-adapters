@@ -27,7 +27,6 @@ process with its own LOCAL_RANK and device assignment.
 Requirements
 ------------
 - transformers==5.15.x  (5.16 changed the tp_plan API; see pyproject.toml)
-- HF_DEACTIVATE_ASYNC_LOAD=1  (disables async weight loading, required for TP with transformers 5.15)
 
 How to run
 ----------
@@ -42,7 +41,6 @@ independently verifiable from this script.
 2-card example (valid indices are node-specific — check yours first)::
 
     export SPYRE_DEVICES=0,1
-    export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=2 --master-port=29500 \\
         scripts/run_multicard_smoke.py --dtype float16
@@ -50,7 +48,6 @@ independently verifiable from this script.
 4-card example::
 
     export SPYRE_DEVICES=0,1,2,3
-    export HF_DEACTIVATE_ASYNC_LOAD=1
     export PYTHONPATH=/path/to/hf-adapters
     torchrun --nproc-per-node=4 --master-port=29500 \\
         scripts/run_multicard_smoke.py --dtype float16
@@ -76,6 +73,8 @@ import torch
 # Constants
 # ---------------------------------------------------------------------------
 
+pytestmark = pytest.mark.model_harness("causal")
+
 # TODO(torch-spyre): Once torch.spyre.get_device_name(i) is implemented (it
 # needs to call into Flex to map device index → PCI address), resolved_cards
 # can be derived automatically without relying on AIU_WORLD_RANK_* env vars.
@@ -85,7 +84,6 @@ _PROMPT = "The capital of France is"
 _EXPECTED_SUBSTRING = "Paris"
 _DEFAULT_MAX_NEW_TOKENS = 8
 _DEFAULT_BATCH_SIZE = 1
-_DEFAULT_PROMPT_LEN = None  # None → no padding, use natural token length
 
 # Compile-spike outlier filter: tokens whose latency exceeds this multiple of
 # the median are excluded from the steady-state ITL figure.  This catches the
@@ -148,7 +146,6 @@ def run_multicard_smoke_test(
     max_new_tokens: int = _DEFAULT_MAX_NEW_TOKENS,
     dtype: "torch.dtype | None" = None,
     batch_size: int = _DEFAULT_BATCH_SIZE,
-    prompt_len: "int | None" = _DEFAULT_PROMPT_LEN,
 ) -> dict[str, Any]:
     """Load model and generate tokens; return a diagnostics dict.
 
@@ -162,8 +159,6 @@ def run_multicard_smoke_test(
         max_new_tokens: Token generation budget.
         dtype:          Torch dtype passed to from_pretrained (None = model default).
         batch_size:     Number of identical prompts to batch together (default 1).
-        prompt_len:     Pad the tokenized prompt to exactly this many tokens
-                        (None = no padding, use natural token length).
 
     Returns a dict with keys:
         model              - model path used
@@ -174,7 +169,6 @@ def run_multicard_smoke_test(
         local_rank         - LOCAL_RANK of this process
         world_size         - WORLD_SIZE of this run
         batch_size         - batch size used
-        prompt_len         - prompt_len argument (None if not set)
         status             - "PASS" | "FAIL" | "ERROR"
         load_s             - seconds spent in from_pretrained (None on load error)
         gen_s              - seconds spent in generate() (None on gen error)
@@ -228,7 +222,6 @@ def run_multicard_smoke_test(
     print(f"  WORLD_SIZE    : {world_size}")
     print(f"  max_new_tokens: {max_new_tokens}")
     print(f"  batch_size    : {batch_size}")
-    print(f"  prompt_len    : {prompt_len if prompt_len is not None else '(natural)'}")
     print(f"  Datatype      : {dtype}")
     print(f"  Prompt        : {_PROMPT!r}")
     print(f"{'=' * 70}")
@@ -241,14 +234,15 @@ def run_multicard_smoke_test(
         "local_rank": local_rank,
         "world_size": world_size,
         "batch_size": batch_size,
-        "prompt_len": prompt_len,
         "status": "ERROR",
         "load_s": None,
         "gen_s": None,
         "ttft_ms": None,
         "decode_ms": None,
         "steady_itl_ms": None,
-        "output": "",
+        "outputs": [],   # decoded text per sequence (populated after generation)
+        "output": "",    # sequence 0 text, for backward-compat / single-card use
+        "seq_checks": [],
         "error": None,
     }
 
@@ -273,33 +267,17 @@ def run_multicard_smoke_test(
         print(f"  [rank {local_rank}] Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}")
         return result
 
-    # Build the batched + optionally length-padded input tensor.
     # batch_size > 1: repeat the same prompt N times (tests the KV cache batch
     # scatter path without needing N different prompts).
-    # prompt_len: pad/truncate to a fixed token count so callers can exercise
-    # different cache shapes.
     prompts = [_PROMPT] * batch_size
-    if prompt_len is not None:
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
-        encoded = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=prompt_len,
-            truncation=True,
-            return_attention_mask=True,
-        )
-    else:
-        encoded = encode_generation_inputs(tokenizer, prompts)
+    encoded = encode_generation_inputs(tokenizer, prompts)
 
     actual_prompt_len = encoded["input_ids"].shape[1]
     print(f"  Input shape   : {list(encoded['input_ids'].shape)}  "
           f"(batch={batch_size}, tokens={actual_prompt_len})")
 
-    def _run_generate() -> tuple[str, str]:
-        """Run one generate call, return (output_text, captured_stdout)."""
+    def _run_generate() -> tuple[list[str], str]:
+        """Run one generate call; return (output_texts_per_seq, captured_stdout)."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             sequences = model.generate(
@@ -310,12 +288,11 @@ def run_multicard_smoke_test(
             )
         captured = buf.getvalue()
         print(captured, end="")
-        # Decode only the newly generated tokens for sequence 0.
-        output_text = tokenizer.decode(
-            sequences[0, actual_prompt_len:],
-            skip_special_tokens=True,
-        )
-        return output_text, captured
+        output_texts = [
+            tokenizer.decode(sequences[i, actual_prompt_len:], skip_special_tokens=True)
+            for i in range(sequences.shape[0])
+        ]
+        return output_texts, captured
 
     # ── Phase 2: generation (warm up) ────────────────────────────────────────────────
     print(f"\n{'=' * 20} Warmup Model...")
@@ -324,12 +301,13 @@ def run_multicard_smoke_test(
     except Exception:
         result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
         print(f"  [rank {local_rank}] Warmup FAILED:\n{result['error']}")
+        return result
 
     # ── Phase 3: generation ────────────────────────────────────────────────
     print(f"\n{'=' * 20} Run Model...")
     gen_t0 = time.time()
     try:
-        output_text, captured = _run_generate()
+        output_texts, captured = _run_generate()
         result["gen_s"] = time.time() - gen_t0
 
         ttft, decode, per_token = _parse_timing(captured)
@@ -337,14 +315,43 @@ def run_multicard_smoke_test(
         result["decode_ms"] = decode
         result["steady_itl_ms"] = _steady_state_itl(per_token)
 
-        result["output"] = output_text
-        print(f"  Output     : {output_text!r}")
+        result["outputs"] = output_texts
+        result["output"] = output_texts[0] if output_texts else ""
+
+        for i, text in enumerate(output_texts):
+            print(f"  Output[{i}]  : {text!r}")
         print(f"  Gen time   : {result['gen_s']:.1f}s  [OK]")
         if result["steady_itl_ms"] is not None:
-            print(
-                f"  Steady ITL : {result['steady_itl_ms']:.1f} ms  (outliers excluded)"
-            )
-        result["status"] = "PASS" if output_text.strip() else "FAIL"
+            print(f"  Steady ITL : {result['steady_itl_ms']:.1f} ms  (outliers excluded)")
+
+        # Validate every sequence: non-empty, has tokens, not all-zero, not all-same.
+        seq_checks: list[dict] = []
+        for text in output_texts:
+            c: dict[str, Any] = {
+                "non_empty": len(text.strip()) > 0,
+                "not_all_spaces": text.strip() != "",
+            }
+            if text:
+                gen_ids = tokenizer.encode(text, add_special_tokens=False)
+                c["has_tokens"] = len(gen_ids) > 0
+                c["not_all_zero"] = not all(t == 0 for t in gen_ids)
+                c["not_all_same"] = len(set(gen_ids)) > 1 or len(gen_ids) <= 1
+            else:
+                c["has_tokens"] = False
+                c["not_all_zero"] = False
+                c["not_all_same"] = False
+            seq_checks.append(c)
+
+        result["seq_checks"] = seq_checks
+        all_pass = all(
+            v for c in seq_checks for k, v in c.items()
+        )
+        result["status"] = "PASS" if all_pass else "FAIL"
+        if not all_pass:
+            for i, c in enumerate(seq_checks):
+                failed = [k for k, v in c.items() if not v]
+                if failed:
+                    print(f"  [seq {i}] FAIL checks: {failed}")
     except Exception:
         result["gen_s"] = time.time() - gen_t0
         result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
@@ -364,15 +371,17 @@ def run_multicard_smoke_test(
 
 @pytest.mark.parametrize("model_path", [_DEFAULT_MODEL])
 def test_multicard_smoke_single_card(model_path: str) -> None:
-    """Single-card smoke test: load, generate, verify output contains expected text."""
+    """Single-card smoke test: load, generate, verify output passes all checks."""
     result = run_multicard_smoke_test(model_path)
     assert result["status"] == "PASS", (
         f"Smoke test failed with status {result['status']}.\n"
+        f"Checks: {result.get('seq_checks')}\n"
         f"Error: {result['error']}"
     )
-    assert (
-        _EXPECTED_SUBSTRING.lower() in result["output"].lower()
-    ), f"Expected {_EXPECTED_SUBSTRING!r} in output, got {result['output']!r}"
+    assert any(
+        _EXPECTED_SUBSTRING.lower() in text.lower()
+        for text in result.get("outputs", [result["output"]])
+    ), f"Expected {_EXPECTED_SUBSTRING!r} in outputs, got {result.get('outputs')!r}"
 
 
 # ---------------------------------------------------------------------------
