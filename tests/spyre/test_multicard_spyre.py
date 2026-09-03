@@ -217,7 +217,9 @@ def run_multicard_smoke_test(
     print(f"  Model         : {model_path}")
     print(f"  SPYRE_DEVICES : {spyre_devices_env!r}")
     if resolved_cards:
-        print(f"  PCI hint      : {', '.join(resolved_cards)}  (AIU_WORLD_RANK_* guess, unconfirmed)")
+        print(
+            f"  PCI hint      : {', '.join(resolved_cards)}  (AIU_WORLD_RANK_* guess, unconfirmed)"
+        )
     print(f"  AIU_IDS       : {aiu_ids_env!r}")
     print(f"  WORLD_SIZE    : {world_size}")
     print(f"  max_new_tokens: {max_new_tokens}")
@@ -240,8 +242,8 @@ def run_multicard_smoke_test(
         "ttft_ms": None,
         "decode_ms": None,
         "steady_itl_ms": None,
-        "outputs": [],   # decoded text per sequence (populated after generation)
-        "output": "",    # sequence 0 text, for backward-compat / single-card use
+        "outputs": [],  # decoded text per sequence (populated after generation)
+        "output": "",  # sequence 0 text, for backward-compat / single-card use
         "seq_checks": [],
         "error": None,
     }
@@ -264,7 +266,9 @@ def run_multicard_smoke_test(
     except Exception:
         result["load_s"] = time.time() - load_t0
         result["error"] = "LOAD FAILED\n" + traceback.format_exc()
-        print(f"  [rank {local_rank}] Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}")
+        print(
+            f"  [rank {local_rank}] Load FAILED (after {result['load_s']:.1f}s):\n{result['error']}"
+        )
         return result
 
     # batch_size > 1: repeat the same prompt N times (tests the KV cache batch
@@ -273,8 +277,10 @@ def run_multicard_smoke_test(
     encoded = encode_generation_inputs(tokenizer, prompts)
 
     actual_prompt_len = encoded["input_ids"].shape[1]
-    print(f"  Input shape   : {list(encoded['input_ids'].shape)}  "
-          f"(batch={batch_size}, tokens={actual_prompt_len})")
+    print(
+        f"  Input shape   : {list(encoded['input_ids'].shape)}  "
+        f"(batch={batch_size}, tokens={actual_prompt_len})"
+    )
 
     def _run_generate() -> tuple[list[str], str]:
         """Run one generate call; return (output_texts_per_seq, captured_stdout)."""
@@ -322,7 +328,9 @@ def run_multicard_smoke_test(
             print(f"  Output[{i}]  : {text!r}")
         print(f"  Gen time   : {result['gen_s']:.1f}s  [OK]")
         if result["steady_itl_ms"] is not None:
-            print(f"  Steady ITL : {result['steady_itl_ms']:.1f} ms  (outliers excluded)")
+            print(
+                f"  Steady ITL : {result['steady_itl_ms']:.1f} ms  (outliers excluded)"
+            )
 
         # Validate every sequence: non-empty, has tokens, not all-zero, not all-same.
         seq_checks: list[dict] = []
@@ -343,9 +351,7 @@ def run_multicard_smoke_test(
             seq_checks.append(c)
 
         result["seq_checks"] = seq_checks
-        all_pass = all(
-            v for c in seq_checks for k, v in c.items()
-        )
+        all_pass = all(v for c in seq_checks for k, v in c.items())
         result["status"] = "PASS" if all_pass else "FAIL"
         if not all_pass:
             for i, c in enumerate(seq_checks):
@@ -355,7 +361,9 @@ def run_multicard_smoke_test(
     except Exception:
         result["gen_s"] = time.time() - gen_t0
         result["error"] = "GENERATE FAILED\n" + traceback.format_exc()
-        print(f"  [rank {local_rank}] Generate FAILED (after {result['gen_s']:.1f}s):\n{result['error']}")
+        print(
+            f"  [rank {local_rank}] Generate FAILED (after {result['gen_s']:.1f}s):\n{result['error']}"
+        )
 
     return result
 
