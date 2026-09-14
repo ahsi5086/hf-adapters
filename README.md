@@ -322,23 +322,29 @@ uv run pytest tests/test_load_cpu.py                              # CPU load tes
 ### Spyre Tests (requires Spyre hardware)
 
 The Spyre lane lives under `tests/spyre/` and is also pytest-driven (not
-`python tests/...`). Each test is parametrized off the model registry, so a
-single model is selected with `-k <key>` (e.g. `granite2b`, `qwen3`, `bge_base`).
-Run the whole file to cover every registered model. Run from the repository root.
+`python tests/...`). Each test is parametrized off the model registry using
+HF paths as test IDs. Select a specific model with `-k <path-substring>` or
+`--model-path <hf-path>`. Run from the repository root.
+
+> **Note:** Inside a Spyre container where a virtualenv is already active, drop
+> the `uv run` prefix and use `pytest` directly (e.g.
+> `pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ...`).
 
 ```bash
 # E2E smoke test (real weights, verify non-trivial output)
-uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py                  # one representative model per adapter
-uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k granite2b     # one model
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py                                                   # one representative model per adapter
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k "granite-3.3-2b"                               # one model by path substring
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ibm-granite/granite-3.3-2b-instruct  # exact model by HF path
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ibm-granite/granite-3.3-8b-instruct  # model not in default collection
 
 # E2E token comparison (HF CPU vs adapter Spyre, per-step greedy tokens)
-uv run pytest -s -vvv tests/spyre/test_e2e_token_compare_spyre.py -k granite2b
+uv run pytest -s -vvv tests/spyre/test_e2e_token_compare_spyre.py -k "granite-3.3-2b"
 
 # E2E embedding comparison (HF CPU vs adapter Spyre, hidden-states cosine)
-uv run pytest -s -vvv tests/spyre/test_e2e_embed_compare_spyre.py -k bge_base
+uv run pytest -s -vvv tests/spyre/test_e2e_embed_compare_spyre.py -k "bge-base"
 
 # E2E multimodal VLM (image→text; teacher-forced per-step logit comparison)
-uv run pytest -s -vvv tests/spyre/test_vlm_e2e_spyre.py -k granite_vision_mm
+uv run pytest -s -vvv tests/spyre/test_vlm_e2e_spyre.py -k "granite-vision"
 
 # Load test (verify a model loads on Spyre without errors)
 uv run pytest -s -vvv tests/spyre/test_load_spyre.py

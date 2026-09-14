@@ -22,8 +22,10 @@ Verifies:
 
 Usage (on Spyre pod)::
 
-    pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py
-    pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k qwen3
+    pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py                                                  # all representative models
+    pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k "Qwen3-0.6B"                                  # one model by path substring
+    pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path Qwen/Qwen3-0.6B                     # exact model by HF path
+    pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ibm-granite/granite-3.3-8b-instruct  # model not in default collection
 """
 
 import time
