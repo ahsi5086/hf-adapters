@@ -354,6 +354,48 @@ uv run pytest -s -vvv tests/spyre/test_load_spyre.py
 `-s -vvv` matches each test's documented usage and shows the per-step comparison
 tables the token / embedding / VLM tests print.
 
+### Multi-card (Tensor-Parallel) Smoke Test
+
+For tensor-parallel runs across 2 or 4 cards use
+`scripts/run_multicard_smoke.py`, launched via `torchrun` — one process per
+card. `SPYRE_DEVICES` selects which card indices to use per rank.
+
+By default the model stops at EOS after just a few tokens. Pass
+`--min-new-tokens` equal to `--max-new-tokens` to suppress EOS and force
+exactly N tokens every run, which is required for meaningful latency
+benchmarking.
+
+```bash
+# 1-card — baseline latency measurement (256 tokens)
+export SPYRE_DEVICES=0
+torchrun --nproc-per-node=1 --master-port=29500 \
+    scripts/run_multicard_smoke.py \
+    --model ibm-granite/granite-3.3-8b-instruct \
+    --dtype float16 \
+    --max-new-tokens 256 --min-new-tokens 256
+
+# 2-card tensor-parallel
+export SPYRE_DEVICES=0,1
+torchrun --nproc-per-node=2 --master-port=29500 \
+    scripts/run_multicard_smoke.py \
+    --model ibm-granite/granite-3.3-8b-instruct \
+    --dtype float16 \
+    --max-new-tokens 256 --min-new-tokens 256
+
+# 4-card tensor-parallel
+export SPYRE_DEVICES=0,1,2,3
+torchrun --nproc-per-node=4 --master-port=29500 \
+    scripts/run_multicard_smoke.py \
+    --model ibm-granite/granite-3.3-8b-instruct \
+    --dtype float16 \
+    --max-new-tokens 256 --min-new-tokens 256
+```
+
+Use any value for `--max-new-tokens` / `--min-new-tokens` (e.g. 64, 512).
+Use `--model` to target any HuggingFace repo ID or local path.
+The script prints a RESULTS SUMMARY with TTFT, decode latency, and
+steady-state ITL per rank, and exits with code 0 on PASS, 1 on FAIL.
+
 Numerical gating depends on the workload. The blocking causal token-comparison
 lane requires exact greedy top-1 agreement with CPU over prefill and four decode
 steps. The VLM lane instead asserts a per-step logit cosine floor because its
